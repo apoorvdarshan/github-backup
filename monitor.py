@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fail when the independent GitLab backup has no recent successful run."""
+"""Fail when the GitHub Actions backup has no recent successful run."""
 import datetime as dt
 import json
 import os
@@ -7,7 +7,7 @@ import sys
 import urllib.error
 import urllib.request
 
-API = 'https://gitlab.com/api/v4/projects/87536066'
+API = 'https://api.github.com/repos/' + os.environ.get('GITHUB_REPOSITORY', 'apoorvdarshan/github-backup')
 
 
 def age_hours(finished_at, now):
@@ -21,30 +21,30 @@ def age_hours(finished_at, now):
 
 
 def get(path):
-    req = urllib.request.Request(API + path, headers={'PRIVATE-TOKEN': os.environ['GITLAB_MONITOR_TOKEN']})
+    req = urllib.request.Request(API + path, headers={'Authorization': 'Bearer ' + os.environ['GITHUB_TOKEN'], 'Accept': 'application/vnd.github+json'})
     with urllib.request.urlopen(req, timeout=45) as response:
         return json.load(response)
 
 
 def main():
     try:
-        pipelines = get('/pipelines?status=success&ref=main&order_by=id&sort=desc&per_page=1')
-        if not pipelines:
+        runs = get('/actions/workflows/backup.yml/runs?status=success&branch=main&per_page=1')['workflow_runs']
+        if not runs:
             raise ValueError('No successful backup exists')
-        pipeline = get('/pipelines/' + str(int(pipelines[0]['id'])))
-        if pipeline['status'] != 'success' or not pipeline.get('finished_at'):
+        run = runs[0]
+        if run['status'] != 'completed' or run['conclusion'] != 'success' or run['head_branch'] != 'main':
             raise ValueError('No completed successful backup')
-        age = age_hours(pipeline['finished_at'], dt.datetime.now(dt.timezone.utc))
+        age = age_hours(run['updated_at'], dt.datetime.now(dt.timezone.utc))
         if age > 30:
             raise ValueError('Last successful backup is older than 30 hours')
-        print(f'GitLab backup healthy: last successful run {age:.1f} hours ago.')
+        print(f'GitHub-to-GitLab backup healthy: last successful run {age:.1f} hours ago.')
         return 0
     except urllib.error.HTTPError as exc:
-        print(f'::error::Cannot check GitLab backup: HTTP {exc.code}. Check monitor credential and GitLab availability.')
+        print(f'::error::Cannot check backup: GitHub API HTTP {exc.code}. Check workflow permissions and GitHub availability.')
     except (urllib.error.URLError, TimeoutError):
-        print('::error::Cannot reach GitLab to verify backup freshness.')
+        print('::error::Cannot reach GitHub to verify backup freshness.')
     except (ValueError, KeyError, TypeError):
-        print('::error::GitLab backup is overdue or its status cannot be verified. Open the private backup manager pipeline.')
+        print('::error::Backup is overdue or its status cannot be verified. Open the private backup workflow.')
     return 1
 
 
