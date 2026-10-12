@@ -1,7 +1,7 @@
 # GitLab backup watchdog
 
 Independent cloud-only freshness check for the private GitLab
-[backup manager](https://gitlab.com/apoorv-github-backups/github-backup-manager).
+[backup manager](https://gitlab.com/apoorvdarshan/github-backup-manager).
 GitHub Actions checks every six hours, and fails if the latest successful backup
 is older than 30 hours, unavailable, or cannot be authenticated. Detection is
 therefore normally within 30–36 hours of the last success, plus scheduler delays.
