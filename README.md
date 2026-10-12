@@ -135,6 +135,12 @@ history-repair migration. Never mistake a rewritten migration for this exact bac
 
 ## Validation
 
+Changes to `main` require a pull request and a passing **Backup and monitor tests**
+check on an up-to-date branch. No reviewer approval is required for this sole-owner
+repository. Branch protection also blocks force pushes and deletion of `main`,
+including for administrators. The test workflow receives no backup secrets and
+does not perform live backups. Repository visibility is a separate setting.
+
 Run `python3 -m unittest discover -s tests -v`. Tests exercise actual local Git
 pushes, rewritten-history recovery, deleted-ref retention, bundle restore with a
 malformed historical commit, corrupted archive detection, credential isolation,
