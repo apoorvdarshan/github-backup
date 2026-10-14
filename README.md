@@ -29,7 +29,7 @@ runners run the scheduled job; no Mac, local cron, or self-hosted runner is need
   expiry; monitor storage and prune only after deliberate review.
 - Git refs are verified against GitHub after each write. LFS fetch/upload must
   succeed before new refs are published. Failures fail the pipeline; per-repository
-  results are retained as private GitHub Actions artifacts for 14 days.
+  results are retained as GitHub Actions artifacts for 14 days.
 - If GitLab accepts refs but the push connection fails, a separate read must
   confirm every required ref before the repository is counted as successful.
   Timed-out Git processes and their helpers are terminated together.
@@ -46,11 +46,18 @@ settings, or local uncommitted files. A revoked/narrowed GitHub token can hide r
 missing known sources are listed in the report and never removed from GitLab.
 
 The GitLab projects remain backup storage. GitLab hosted runners are no longer
-needed after migration. This controller stays **private**: its reports and logs
-contain private repository metadata. Its standard GitHub runner jobs consume the
-account's private-repository Actions allowance. Do not make it public or enable
-paid usage automatically. Two workers limit simultaneous temporary clones; source
-code is never executed, and each temporary clone is removed after use.
+needed after migration. This controller repository is **public**, so its
+standard GitHub-hosted runner jobs use free public-repository Actions minutes.
+Its workflow logs and report artifacts are public too: they list source repository
+names (including private ones), GitHub IDs, and private GitLab destination links,
+but never source code, file contents, or credentials. The GitLab backup projects
+stay private. Do not enable paid Actions usage automatically. Two workers limit
+simultaneous temporary clones; source code is never executed, and each temporary
+clone is removed after use.
+
+Repository secrets are never passed to pull requests from forks, and workflows
+from all external contributors require approval before they run. No workflow uses
+`pull_request_target`, and third-party actions are pinned to full commit SHAs.
 
 ## Credentials and alerts
 
@@ -148,5 +155,9 @@ redirect authentication, and fresh/stale/missing workflow checks. LFS transport
 is verified by real cloud backup runs rather than mocked local tests.
 
 A successful live backup requires `report.json` to contain one successful result
-per source repository and `complete: true`. The private Actions artifact records
+per source repository and `complete: true`. The public Actions artifact records
 source IDs, destination links, backup format, and the Scrapy bundle package version.
+
+## License
+
+[MIT](LICENSE)
