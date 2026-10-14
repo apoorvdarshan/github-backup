@@ -44,7 +44,7 @@ def main():
     except (urllib.error.URLError, TimeoutError):
         print('::error::Cannot reach GitHub to verify backup freshness.')
     except (ValueError, KeyError, TypeError):
-        print('::error::Backup is overdue or its status cannot be verified. Open the private backup workflow.')
+        print('::error::Backup is overdue or its status cannot be verified. Open the backup workflow.')
     return 1
 
 
