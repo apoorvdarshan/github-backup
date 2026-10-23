@@ -13,6 +13,67 @@ from unittest.mock import patch
 import backup
 
 
+def backup_project(project_id, source_id, **fields):
+    description = f'Private backup of https://github.com/{backup.OWNER}/example. Development stays on GitHub. Source repository ID: {source_id}.'
+    return {'id': project_id, 'path': f'example-{project_id}', 'name': f'example-{project_id}', 'web_url': f'https://gitlab.example.invalid/example-{project_id}',
+            'description': description, 'visibility': 'private', 'namespace': {'id': int(backup.NAMESPACE_ID)}, **fields}
+
+
+def listed_repo(source_id):
+    return {'id': source_id, 'name': f'repo-{source_id}', 'full_name': f'{backup.OWNER}/repo-{source_id}', 'owner': {'login': backup.OWNER}}
+
+
+def deletion_api(resolvable=(), failing=()):
+    """Fake api() for deletion checks that follows the real GitHub/GitLab routing contract."""
+    calls = []
+    def api(method, path, data=None, github=False, missing_ok=False):
+        calls.append((method, path, github, missing_ok))
+        if path.startswith('/repositories/'):
+            # GitLab answers 404 for this route too, so a misrouted check would delete everything.
+            if not github:
+                raise AssertionError('Repository lookups must go to GitHub')
+            source_id = int(path.rsplit('/', 1)[1])
+            if source_id in failing:
+                raise backup.BackupError('GitHub API GET failed: HTTP 500')
+            if source_id in resolvable:
+                return {'id': source_id}
+            if not missing_ok:
+                raise backup.BackupError('GitHub API GET failed: HTTP 404')
+            return None
+        if github or method != 'DELETE':
+            raise AssertionError(f'Unexpected API call {method} {path}')
+        return {'message': '202 Accepted'}
+    return api, calls
+
+
+def run_main(repos, listings, lookup, limit='10'):
+    """Run main() against fake APIs; return its exit code, report, and processed repositories."""
+    def api(method, path, data=None, github=False, missing_ok=False):
+        if path == '/user':
+            return {'login': backup.OWNER} if github else {'username': backup.NAMESPACE_PATH, 'id': 5}
+        if path.startswith('/namespaces/'):
+            return {'full_path': backup.NAMESPACE_PATH, 'kind': 'user'}
+        return lookup(method, path, data, github, missing_ok)
+    listings = iter(listings)
+    def pages(path, github=False):
+        return repos if github else next(listings)
+    processed = []
+    def process(repo, existing):
+        processed.append((repo['id'], existing))
+        return {'repository': repo['full_name'], 'status': 'synced'}
+    with tempfile.TemporaryDirectory() as tmp:
+        cwd = os.getcwd()
+        os.chdir(tmp)
+        try:
+            with patch.dict(os.environ, BACKUP_MAX_DELETIONS=limit), patch.object(backup, 'api', side_effect=api), \
+                    patch.object(backup, 'pages', side_effect=pages), patch.object(backup, 'process', side_effect=process), \
+                    patch('builtins.print'):
+                code = backup.main()
+            return code, json.loads(Path('report.json').read_text()), processed
+        finally:
+            os.chdir(cwd)
+
+
 class SafetyTests(unittest.TestCase):
     def test_package_redirect_does_not_forward_gitlab_token(self):
         requests = []
@@ -82,6 +143,96 @@ class SafetyTests(unittest.TestCase):
             with self.assertRaises(backup.BackupError):
                 backup.destination_project(repo, existing)
             api.assert_not_called()
+
+    def test_new_destination_avoids_retained_name_and_path(self):
+        repo = {'name': 'Example', 'id': 123}
+        retained = {'path': 'example', 'name': 'Example', 'description': 'Source repository ID: 9.'}
+        renamed = {'path': 'other', 'name': 'example', 'description': 'unrelated'}
+        for existing in ([retained], [renamed]):
+            created = []
+            def api(method, path, data=None, missing_ok=False):
+                created.append(data)
+                return {'id': 1, 'description': data['description']}
+            with patch.object(backup, 'api', side_effect=api), patch.object(backup, 'pages', return_value=[]):
+                backup.destination_project(repo, existing)
+            self.assertEqual((created[0]['name'], created[0]['path']), ('Example-github-123', 'example-github-123'))
+
+    def test_failed_destination_creation_reports_api_status(self):
+        def api(method, path, data=None, missing_ok=False):
+            if method == 'POST':
+                raise backup.BackupError('GitLab API POST failed: HTTP 400')
+        with patch.object(backup, 'api', side_effect=api):
+            with self.assertRaisesRegex(backup.BackupError, 'HTTP 400'):
+                backup.destination_project({'name': 'example', 'id': 123}, [])
+
+    def test_only_backups_of_confirmed_deleted_sources_are_deleted(self):
+        existing = [backup_project(1, 10), backup_project(2, 20), backup_project(3, 30),
+                    backup_project(4, 40, marked_for_deletion_on='2026-10-23'),
+                    backup_project(6, 60, path='example-deletion_scheduled-6'),
+                    {'id': 5, 'path': 'manager', 'description': 'Source repository ID: 50.'}]
+        # Source 30 was renamed or transferred, so GitHub still resolves its ID.
+        api, calls = deletion_api(resolvable={30})
+        with patch.object(backup, 'api', side_effect=api), patch('builtins.print'):
+            deleted, errors = backup.delete_removed_sources([{'id': 10}], existing)
+        self.assertEqual((deleted, errors), (['example-2'], []))
+        self.assertIn(('GET', '/repositories/20', True, True), calls)
+        self.assertEqual([c for c in calls if c[0] == 'DELETE'], [('DELETE', '/projects/2', False, False)])
+        for skipped in (10, 40, 50, 60):
+            self.assertFalse([c for c in calls if c[1] == f'/repositories/{skipped}'])
+
+    def test_deletion_limit_counts_only_confirmed_deletions(self):
+        existing = [backup_project(i, i) for i in range(1, 13)]
+        for limit, resolvable, deleted_count in [('10', (), 0), ('0', (), 0), ('12', (), 12), ('10', {1, 2}, 10),
+                                                  ('1', set(range(1, 12)), 1)]:
+            api, calls = deletion_api(resolvable=resolvable)
+            with patch.dict(os.environ, BACKUP_MAX_DELETIONS=limit), patch.object(backup, 'api', side_effect=api), patch('builtins.print'):
+                deleted, errors = backup.delete_removed_sources([{'id': 999}], existing)
+            self.assertEqual(len(deleted), deleted_count)
+            self.assertEqual(len([c for c in calls if c[0] == 'DELETE']), deleted_count)
+            self.assertEqual(bool(errors), deleted_count == 0)
+        for limit in ('-1', 'all', ''):
+            with patch.dict(os.environ, BACKUP_MAX_DELETIONS=limit), patch.object(backup, 'api') as api:
+                with self.assertRaises(backup.BackupError):
+                    backup.delete_removed_sources([{'id': 999}], existing)
+                api.assert_not_called()
+
+    def test_failed_deletion_check_is_reported_and_others_continue(self):
+        api, calls = deletion_api(failing={10})
+        with patch.object(backup, 'api', side_effect=api), patch('builtins.print'):
+            deleted, errors = backup.delete_removed_sources([{'id': 99}], [backup_project(1, 10), backup_project(2, 20)])
+        self.assertEqual(deleted, ['example-2'])
+        self.assertEqual(len(errors), 1)
+        self.assertIn('HTTP 500', errors[0])
+
+    def test_returning_source_restores_scheduled_backup(self):
+        project = backup_project(1, 123, marked_for_deletion_on='2026-10-23')
+        restored = backup_project(1, 123)
+        with patch.object(backup, 'api', return_value=restored) as api:
+            self.assertEqual(backup.destination_project({'name': 'example', 'id': 123}, [project]), restored)
+        api.assert_called_once_with('POST', '/projects/1/restore')
+
+    def test_main_deletes_before_creating_destinations(self):
+        before = [backup_project(1, 99, path='repo-7', name='repo-7')]
+        after = [backup_project(1, 99, path='repo-7-deletion_scheduled-1', name='repo-7-deletion_scheduled-1',
+                                marked_for_deletion_on='2026-10-23')]
+        lookup, calls = deletion_api()
+        code, report, processed = run_main([listed_repo(7)], [before, after], lookup)
+        self.assertEqual(code, 0)
+        self.assertEqual(processed, [(7, after)])
+        self.assertEqual(report['deleted_missing_sources'], ['repo-7'])
+        self.assertEqual(report['retained_missing_sources'], [])
+        self.assertTrue(report['complete'])
+
+    def test_main_fails_without_deleting_when_too_many_sources_vanish(self):
+        existing = [backup_project(i, i) for i in range(1, 13)]
+        lookup, calls = deletion_api()
+        code, report, processed = run_main([listed_repo(99)], [existing], lookup)
+        self.assertEqual(code, 1)
+        self.assertFalse(report['complete'])
+        self.assertIn('refusing', report['deletion_errors'][0])
+        self.assertFalse([c for c in calls if c[0] == 'DELETE'])
+        self.assertEqual([repo_id for repo_id, _ in processed], [99])
+        self.assertEqual(len(report['retained_missing_sources']), 12)
 
     def test_private_and_quiet_settings(self):
         settings = backup.project_settings({'name': 'example', 'id': 123})
