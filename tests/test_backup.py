@@ -74,6 +74,32 @@ def run_main(repos, listings, lookup, limit='10'):
             os.chdir(cwd)
 
 
+
+def local_repositories(root):
+    """A source checkout and a destination bare repository for real local pushes."""
+    env = dict(os.environ, GIT_AUTHOR_NAME='Test', GIT_COMMITTER_NAME='Test', GIT_AUTHOR_EMAIL='test@example.invalid', GIT_COMMITTER_EMAIL='test@example.invalid')
+    original = backup.command
+    def git(*args, cwd=None):
+        return original(['git', *args], cwd=cwd, env=env).strip()
+    src, dst = root / 'source', root / 'destination.git'
+    git('init', '-b', 'master', str(src))
+    git('init', '--bare', str(dst))
+    git('symbolic-ref', 'HEAD', 'refs/heads/master', cwd=dst)
+    git('commit', '--allow-empty', '-m', 'original', cwd=src)
+    return src, dst, env, git
+
+
+def fake_gitlab(dst, env, git, calls):
+    """api() that, like GitLab, only switches to an existing default branch and moves HEAD."""
+    def api(method, path, data=None):
+        refs = backup.remote_refs(str(dst), env)
+        calls.append((method, path, data, 'refs/heads/master' in refs))
+        if data:
+            if 'refs/heads/' + data['default_branch'] not in refs:
+                raise backup.BackupError('GitLab API PUT failed: HTTP 400')
+            git('symbolic-ref', 'HEAD', 'refs/heads/' + data['default_branch'], cwd=dst)
+    return api
+
 class SafetyTests(unittest.TestCase):
     def test_package_redirect_does_not_forward_gitlab_token(self):
         requests = []
@@ -126,8 +152,21 @@ class SafetyTests(unittest.TestCase):
                 self.assertNotIn('GITLAB_TOKEN', env)
                 self.assertEqual(env['BACKUP_GIT_TOKEN'], 'expected-secret')
 
-    def test_extra_destination_refs_are_retained(self):
-        self.assertTrue(backup.source_matches({'refs/heads/main': 'a'}, {'refs/heads/main': 'a', 'refs/heads/deleted-upstream': 'b'}))
+    def test_deleted_refs_are_stale_but_recovery_tags_stay(self):
+        recovery = backup.RECOVERY + 'run/abc-old'
+        destination = {'refs/heads/main': 'a', 'refs/heads/deleted-upstream': 'b', 'refs/tags/gone': 'c', recovery: 'd'}
+        self.assertEqual(backup.stale_refs({'refs/heads/main': 'a'}, destination),
+                         {'refs/heads/deleted-upstream': 'b', 'refs/tags/gone': 'c'})
+
+    def test_changed_or_empty_source_never_deletes_refs(self):
+        destination = {'refs/heads/main': 'a', 'refs/heads/gone': 'b'}
+        for first, again in [({'refs/heads/main': 'a'}, {'refs/heads/main': 'c'}), ({}, {})]:
+            with patch.object(backup, 'remote_refs', side_effect=[first, destination, again]), \
+                    patch.object(backup, 'command') as command, patch.object(backup, 'api') as api:
+                with self.assertRaisesRegex(backup.BackupError, 'refusing to delete'):
+                    backup.sync_git('source', 'destination', 'unused', {}, {}, project={'id': 1, 'default_branch': 'main'})
+            command.assert_not_called()
+            api.assert_not_called()
 
     def test_recovery_for_rewritten_branches_and_tags(self):
         src = {'refs/heads/main': 'new', 'refs/tags/v1': 'newtag'}
@@ -301,6 +340,101 @@ class GitIntegrationTests(unittest.TestCase):
                 sync()
             self.assertFalse(any(path.endswith('/manifest.json') for path in stored))
 
+    def test_deleted_branches_and_tags_are_mirrored_without_fetching(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src, dst, env, git = local_repositories(root)
+            sha = git('rev-parse', 'HEAD', cwd=src)
+            for branch in ('main', 'feature'):
+                git('branch', branch, cwd=src)
+            for tag in ('v1', 'old-tag'):
+                git('tag', tag, cwd=src)
+            git('push', str(dst), 'refs/heads/*:refs/heads/*', 'refs/tags/*:refs/tags/*', cwd=src)
+            recovery = f'{backup.RECOVERY}run/abc-{sha}'
+            git('update-ref', recovery, sha, cwd=dst)
+            # The source switched its default to main and deleted master, a branch and a tag.
+            git('checkout', '-q', 'main', cwd=src)
+            git('branch', '-D', 'master', 'feature', cwd=src)
+            git('tag', '-d', 'old-tag', cwd=src)
+            original, commands, calls = backup.command, [], []
+            def record(args, **kw):
+                commands.append(args)
+                return original(args, **kw)
+            project = {'id': 123, 'default_branch': 'master'}
+            with tempfile.TemporaryDirectory(dir=root) as work:
+                with patch.object(backup, 'command', side_effect=record), patch.object(backup, 'api', side_effect=fake_gitlab(dst, env, git, calls)), \
+                        patch.object(backup, 'pages', return_value=[{'name': 'master'}]):
+                    result = backup.sync_git(str(src), str(dst), work, env, env, project=project, default_branch='main')
+            self.assertEqual((result['status'], result['deleted_refs']), ('synced', 3))
+            self.assertEqual(backup.remote_refs(str(dst), env), {'refs/heads/main': sha, 'refs/tags/v1': sha, recovery: sha})
+            # The default moves before its old branch is deleted; the destination refuses to delete HEAD.
+            self.assertEqual(calls, [('PUT', '/projects/123', {'default_branch': 'main'}, True),
+                                     ('DELETE', '/projects/123/protected_branches/master', None, True)])
+            self.assertEqual(project['default_branch'], 'main')
+            self.assertFalse([c for c in commands if 'fetch' in c])
+
+    def test_renamed_default_is_published_before_the_old_branch_is_deleted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src, dst, env, git = local_repositories(root)
+            git('push', str(dst), 'master', cwd=src)
+            git('branch', '-m', 'master', 'main', cwd=src)
+            original, calls = backup.command, []
+            def no_lfs(args, **kw):
+                return '' if 'lfs' in args else original(args, **kw)
+            with tempfile.TemporaryDirectory(dir=root) as work:
+                with patch.object(backup, 'command', side_effect=no_lfs), patch.object(backup, 'api', side_effect=fake_gitlab(dst, env, git, calls)), \
+                        patch.object(backup, 'pages', return_value=[]):
+                    result = backup.sync_git(str(src), str(dst), work, env, env, project={'id': 123, 'default_branch': 'master'}, default_branch='main')
+            self.assertEqual((result['status'], result['deleted_refs']), ('synced', 1))
+            self.assertEqual(set(backup.remote_refs(str(dst), env)), {'refs/heads/main'})
+            self.assertEqual(calls, [('PUT', '/projects/123', {'default_branch': 'main'}, True)])
+
+    def test_refs_blocking_a_renamed_path_are_deleted_first(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src, dst, env, git = local_repositories(root)
+            original = backup.command
+            def no_lfs(args, **kw):
+                return '' if 'lfs' in args else original(args, **kw)
+            def sync():
+                with tempfile.TemporaryDirectory(dir=root) as work:
+                    with patch.object(backup, 'command', side_effect=no_lfs), patch.object(backup, 'api'), patch.object(backup, 'pages', return_value=[]):
+                        return backup.sync_git(str(src), str(dst), work, env, env, project={'id': 123, 'default_branch': 'master'})
+            git('branch', 'docs', cwd=src)
+            git('tag', 'v1', cwd=src)
+            self.assertEqual(sync()['status'], 'synced')
+            # Git cannot hold docs and docs/intro (or v1 and v1/intro) at once, in either direction.
+            for old, new in [('docs', 'docs/intro'), ('docs/intro', 'docs')]:
+                git('branch', '-m', old, new, cwd=src)
+                old_tag, new_tag = old.replace('docs', 'v1'), new.replace('docs', 'v1')
+                sha = git('rev-parse', f'refs/tags/{old_tag}', cwd=src)
+                git('tag', '-d', old_tag, cwd=src)
+                git('tag', new_tag, sha, cwd=src)
+                self.assertEqual(sync()['status'], 'synced')
+                self.assertEqual(backup.remote_refs(str(dst), env), backup.remote_refs(str(src), env))
+            self.assertEqual(sync()['status'], 'unchanged')
+
+    def test_deletion_lease_keeps_a_ref_that_changed_meanwhile(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src, dst, env, git = local_repositories(root)
+            git('branch', 'gone', cwd=src)
+            git('push', str(dst), 'master', 'gone', cwd=src)
+            git('branch', '-D', 'gone', cwd=src)
+            moved = git('commit-tree', git('rev-parse', 'master^{tree}', cwd=src), '-p', 'refs/heads/gone', '-m', 'moved', cwd=dst)
+            original = backup.command
+            def move_first(args, **kw):
+                # Someone updates the branch between the listing and the deletion.
+                if ':refs/heads/gone' in args:
+                    git('update-ref', 'refs/heads/gone', moved, cwd=dst)
+                return original(args, **kw)
+            with tempfile.TemporaryDirectory(dir=root) as work:
+                with patch.object(backup, 'command', side_effect=move_first), patch.object(backup, 'api'), patch.object(backup, 'pages', return_value=[]):
+                    with self.assertRaises(backup.BackupError):
+                        backup.sync_git(str(src), str(dst), work, env, env, project={'id': 123, 'default_branch': 'master'})
+            self.assertEqual(backup.remote_refs(str(dst), env)['refs/heads/gone'], moved)
+
     def test_default_branch_tag_collision_preserves_original_refs(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -355,10 +489,14 @@ class GitIntegrationTests(unittest.TestCase):
             include_lfs = False
             simulate_lost_ack = False
             unprotected = []
+            protected = [{'name': 'main'}]
             def remove_protection(method, path):
                 self.assertEqual((method, path), ('DELETE', '/projects/123/protected_branches/main'))
                 saved = backup.remote_refs(str(dst), env)
                 self.assertIn(first, [sha for ref, sha in saved.items() if ref.startswith(backup.RECOVERY)])
+                # Protection must go before the protected branch is force-updated.
+                self.assertEqual(saved['refs/heads/main'], first)
+                protected.clear()
                 unprotected.append(True)
             def no_lfs(args, **kw):
                 if 'lfs' in args:
@@ -375,7 +513,7 @@ class GitIntegrationTests(unittest.TestCase):
                 return output
             def sync():
                 with tempfile.TemporaryDirectory(dir=root) as work:
-                    with patch.object(backup, 'command', side_effect=no_lfs), patch.object(backup, 'pages', return_value=[{'name': 'main'}]), patch.object(backup, 'api', side_effect=remove_protection):
+                    with patch.object(backup, 'command', side_effect=no_lfs), patch.object(backup, 'pages', side_effect=lambda path: list(protected)), patch.object(backup, 'api', side_effect=remove_protection):
                         return backup.sync_git(str(src), str(dst), work, env, env, project={'id': 123, 'default_branch': 'main'})
             self.assertEqual(sync()['status'], 'synced')
             self.assertEqual(lfs_uploads, [])
@@ -393,7 +531,7 @@ class GitIntegrationTests(unittest.TestCase):
             self.assertEqual(unprotected, [True])
             refs = backup.remote_refs(str(dst), env)
             self.assertEqual(refs['refs/heads/main'], git('rev-parse', 'HEAD', cwd=src))
-            self.assertEqual(refs['refs/heads/keep-me'], first)
+            self.assertNotIn('refs/heads/keep-me', refs)
             self.assertIn(first, [sha for ref, sha in refs.items() if ref.startswith(backup.RECOVERY)])
             git('fsck', '--full', cwd=dst)
 
