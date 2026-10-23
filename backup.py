@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Cloud Git backups. Never executes source repository code or deletes backups."""
+"""Cloud Git backups. Never executes source repository code. Deletes a backup only
+after GitHub confirms its source repository was deleted."""
 from __future__ import annotations
 
 import concurrent.futures
@@ -328,31 +329,91 @@ def project_settings(repo):
     }
 
 
+def source_id(project):
+    """GitHub ID of a backup project created by this tool; None for anything else."""
+    description = project.get("description") or ""
+    match = re.search(r"Source repository ID: (\d+)\.", description)
+    if match and description.startswith(f"Private backup of https://github.com/{OWNER}/"):
+        return int(match.group(1))
+    return None
+
+
+def scheduled_for_deletion(project):
+    # GitLab.com keeps a deleted project read-only for 30 days, renamed with this suffix.
+    return bool(project.get("marked_for_deletion_on") or project.get("marked_for_deletion_at")
+                or re.search(r"-deletion_scheduled-\d+$", project.get("path") or ""))
+
+
+def restore_if_scheduled(project):
+    if not scheduled_for_deletion(project):
+        return project
+    # The source exists again (for example, after a GitHub incident); never keep
+    # backing up into a read-only project that GitLab is about to purge.
+    return api("POST", f"/projects/{project['id']}/restore")
+
+
+def delete_removed_sources(repos, existing):
+    """Delete backups of sources GitHub confirms are deleted; GitLab keeps them restorable."""
+    owned = {r["id"] for r in repos}
+    limit = os.environ.get("BACKUP_MAX_DELETIONS", "10")
+    if not limit.isdigit():
+        raise BackupError("Invalid deletion limit")
+    gone, deleted, errors = [], [], []
+    for project in existing:
+        sid = source_id(project)
+        if sid is None or sid in owned or scheduled_for_deletion(project):
+            continue
+        try:
+            # Renamed and transferred repositories still resolve by ID; only a 404 means deleted.
+            if api("GET", f"/repositories/{sid}", github=True, missing_ok=True) is None:
+                gone.append(project)
+        except BackupError as exc:
+            errors.append(f"{project['path']}: {exc}")
+    if len(gone) > int(limit):
+        # Many 404s at once usually means a narrowed token or a GitHub incident.
+        errors.append(f"GitHub reports {len(gone)} source repositories deleted; refusing to delete more than {limit} backups in one run")
+        return deleted, errors
+    for project in gone:
+        try:
+            api("DELETE", f"/projects/{project['id']}")
+            deleted.append(project["path"])
+            print(f"::notice::Deleted GitLab backup {project['path']} because its GitHub repository was deleted (restorable in GitLab for 30 days)", flush=True)
+        except BackupError as exc:
+            errors.append(f"{project['path']}: {exc}")
+    return deleted, errors
+
+
 def destination_project(repo, existing):
     marker = f"Source repository ID: {repo['id']}."
     matches = [p for p in existing if marker in (p.get("description") or "")]
     if len(matches) > 1:
         raise BackupError("Multiple destinations have the same source ID")
-    path = repo["name"].lower()
+    name, path = repo["name"], repo["name"].lower()
     if matches:
-        project = matches[0]
+        project = restore_if_scheduled(matches[0])
         if project["visibility"] != "private":
             api("PUT", f"/projects/{project['id']}", {"visibility": "private"})
         return project
-    if any(p["path"].lower() == path for p in existing):
-        # Never adopt or overwrite an unrelated repository, including the manager.
-        path = f"{path}-github-{repo['id']}"
-    if any(p["path"].lower() == path for p in existing):
+    # GitLab requires both the name and the path to be unique in a namespace.
+    def taken(name, path):
+        return any(p["path"].lower() == path or (p.get("name") or "").lower() == name.lower() for p in existing)
+    if taken(name, path):
+        # Never adopt or overwrite an unrelated repository, including the manager
+        # or a retained backup of a deleted source that had the same name.
+        name, path = f"{name}-github-{repo['id']}", f"{path}-github-{repo['id']}"
+    if taken(name, path):
         raise BackupError("Destination path collision; refusing to overwrite")
     settings = project_settings(repo)
-    settings.update(name=repo["name"], path=path, namespace_id=int(NAMESPACE_ID), initialize_with_readme=False)
+    settings.update(name=name, path=path, namespace_id=int(NAMESPACE_ID), initialize_with_readme=False)
     try:
         project = api("POST", "/projects", settings)
-    except BackupError:
+    except BackupError as exc:
         # An earlier job may have created it after this run's inventory snapshot.
+        # A deleted project's old path redirects to it, so the marker check matters.
         project = api("GET", "/projects/" + urllib.parse.quote(f"{NAMESPACE_PATH}/{path}", safe=""), missing_ok=True)
         if not project or marker not in (project.get("description") or ""):
-            raise BackupError("Could not create or safely identify backup destination") from None
+            raise BackupError(f"Could not create or safely identify backup destination ({exc})") from None
+        project = restore_if_scheduled(project)
     # Backup namespaces have no human contributions; the bot must update rewritten refs.
     for branch in pages(f"/projects/{project['id']}/protected_branches"):
         api("DELETE", f"/projects/{project['id']}/protected_branches/{urllib.parse.quote(branch['name'], safe='')}")
@@ -479,21 +540,37 @@ def main():
         repos = [r for r in repos if r["owner"]["login"].lower() == OWNER.lower()]
         if not repos:
             raise BackupError("GitHub returned zero repositories; refusing empty backup")
-        existing = pages(f"/users/{identity['id']}/projects?order_by=id&sort=asc")
-        existing = [p for p in existing if str(p["namespace"]["id"]) == NAMESPACE_ID]
-        # Stable IDs allow source renames without duplicate destination projects.
-        source_ids = {r["id"] for r in repos}
-        report["retained_missing_sources"] = [p["path"] for p in existing if (m := re.search(r"Source repository ID: (\d+)\.", p.get("description") or "")) and int(m.group(1)) not in source_ids]
-        report["repository_count"] = len(repos)
+        def gitlab_projects():
+            return [p for p in pages(f"/users/{identity['id']}/projects?order_by=id&sort=asc")
+                    if str(p["namespace"]["id"]) == NAMESPACE_ID]
+        existing = gitlab_projects()
         shard_total = int(os.environ.get("CI_NODE_TOTAL", "1"))
         shard_index = int(os.environ.get("CI_NODE_INDEX", "1"))
+        if shard_index == 1:
+            # Delete first so a recreated repository can reuse a freed GitLab name.
+            try:
+                report["deleted_missing_sources"], errors = delete_removed_sources(repos, existing)
+            except BackupError as exc:
+                errors = [str(exc)]
+            if errors:
+                report["deletion_errors"] = errors
+                for error in errors:
+                    print(f"::error::{error}", flush=True)
+            if report.get("deleted_missing_sources"):
+                existing = gitlab_projects()
+        # Stable IDs allow source renames without duplicate destination projects.
+        source_ids = {r["id"] for r in repos}
+        report["retained_missing_sources"] = [p["path"] for p in existing if (sid := source_id(p)) is not None
+                                              and sid not in source_ids and not scheduled_for_deletion(p)]
+        report["repository_count"] = len(repos)
         assigned = assigned_repositories(repos, shard_index, shard_total)
         report.update(shard_index=shard_index, shard_total=shard_total, assigned_count=len(assigned))
         with concurrent.futures.ThreadPoolExecutor(max_workers=int(os.environ.get("BACKUP_WORKERS", "4"))) as pool:
             futures = [pool.submit(process, repo, existing) for repo in assigned]
             for future in concurrent.futures.as_completed(futures):
                 report["results"].append(future.result())
-        report["complete"] = len(report["results"]) == len(assigned) and all(r["status"] != "failed" for r in report["results"])
+        report["complete"] = (len(report["results"]) == len(assigned) and all(r["status"] != "failed" for r in report["results"])
+                              and not report.get("deletion_errors"))
     except BackupError as exc:
         report["error"] = str(exc)
         print(str(exc), file=sys.stderr)

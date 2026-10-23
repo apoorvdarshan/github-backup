@@ -20,9 +20,22 @@ runners run the scheduled job; no Mac, local cron, or self-hosted runner is need
 - Issues, merge requests, CI, wiki, packages, and routine emails are disabled on
   backup projects, except the private package registry for the approved Scrapy
   bundle below. This GitHub repository alone runs backup automation.
-- Missing source repositories and deleted branches/tags are retained. Source
-  renames are matched by stable GitHub repository ID. Unrelated destinations are
-  never overwritten.
+- Deleted branches/tags are retained. Source renames are matched by stable GitHub
+  repository ID. Unrelated destinations are never overwritten or deleted. A new
+  source whose name is still used in GitLab is stored as `<name>-github-<source ID>`.
+- When a GitHub repository is deleted, its GitLab backup is deleted too, but only
+  after GitHub confirms it: the stable repository ID must return HTTP 404. Renamed
+  and transferred repositories still resolve, so their backups stay. GitLab.com
+  keeps a deleted project read-only and restorable for 30 days, renamed to
+  `<path>-deletion_scheduled-<project ID>` so a recreated repository can reuse
+  the name. If the source comes back within that window, the job restores the
+  backup itself. A backup you [restore by hand](https://docs.gitlab.com/user/project/working_with_projects/#restore-a-project)
+  is deleted again by the next run unless you also restore the GitHub repository
+  or remove `Source repository ID: N.` from the GitLab project's description.
+- If GitHub reports more than 10 source repositories deleted in one run (usually
+  a narrowed token or a GitHub incident), nothing is deleted and the run fails. If
+  those deletions were intended, run the backup workflow manually with a higher
+  `max_deletions`.
 - Before replacing an existing branch/tag, the old object is saved under a
   `backup-history/<UTC run>/<ref hash>-<old object>` recovery tag. Leases prevent
   overwriting concurrent destination changes. Recovery tags have no automatic
@@ -42,8 +55,11 @@ runners run the scheduled job; no Mac, local cron, or self-hosted runner is need
 
 This is a Git-data backup, not a full GitHub account export. It does not copy issues,
 PR discussions, release assets, wiki repositories, packages, GitHub Actions history,
-settings, or local uncommitted files. A revoked/narrowed GitHub token can hide repos;
-missing known sources are listed in the report and never removed from GitLab.
+settings, or local uncommitted files. A revoked GitHub token fails the run before
+anything is deleted. A narrowed token can make private repositories look deleted,
+because GitHub answers 404 for both: up to the deletion limit their backups are
+deleted (restorable in GitLab, and restored by the job once the token sees them
+again); beyond it, nothing is deleted and the run fails.
 
 The GitLab projects remain backup storage. GitLab hosted runners are no longer
 needed after migration. This controller repository is **public**, so its
@@ -89,8 +105,9 @@ last completed copies even when GitHub is unavailable.
 
 - Controller: `apoorvdarshan/github-backup` (renamed from `github-backup-monitor`).
 - GitLab personal namespace ID: `126304343`. All backup projects remain private.
-- `.github/workflows/backup.yml`: daily backup plus manual dispatch, serialized
-  by a concurrency group; active runs are never canceled by a newer dispatch.
+- `.github/workflows/backup.yml`: daily backup plus manual dispatch (optional
+  `max_deletions` input, default 10), serialized by a concurrency group; active
+  runs are never canceled by a newer dispatch.
 - `.github/workflows/check.yml`: freshness check every six hours and manual dispatch.
 - The legacy GitLab manager project `87536066` is retained for rollback. Its
   schedule `4487882` and hosted runners are disabled after the first GitHub backup
@@ -98,8 +115,7 @@ last completed copies even when GitHub is unavailable.
 - The obsolete GitLab watchdog PAT and GitHub `GITLAB_MONITOR_TOKEN` secret are
   removed after the new health workflow is verified.
 - Source IDs identify destinations across source renames; no second initial copy
-  is needed. Missing source repositories, deleted refs, and older bundle versions
-  remain retained. Recovery refs are saved before any rewritten source tip replaces
+  is needed. Deleted refs and older bundle versions remain retained. Recovery refs are saved before any rewritten source tip replaces
   the destination, and leased pushes protect against concurrent changes.
 - The local checkout is only for development. No Mac service, cron, or local
   checkout is required for normal operation.
@@ -155,8 +171,9 @@ redirect authentication, and fresh/stale/missing workflow checks. LFS transport
 is verified by real cloud backup runs rather than mocked local tests.
 
 A successful live backup requires `report.json` to contain one successful result
-per source repository and `complete: true`. The public Actions artifact records
-source IDs, destination links, backup format, and the Scrapy bundle package version.
+per source repository, no `deletion_errors`, and `complete: true`. The public
+Actions artifact records source IDs, destination links, backup format, the Scrapy
+bundle package version, and `deleted_missing_sources` (backups deleted in that run).
 
 ## License
 

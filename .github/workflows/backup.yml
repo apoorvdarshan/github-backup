@@ -1,6 +1,11 @@
 name: Back up GitHub to GitLab
 on:
   workflow_dispatch:
+    inputs:
+      max_deletions:
+        description: Most GitLab backups of deleted GitHub repositories to delete in this run
+        type: number
+        default: 10
   schedule:
     - cron: '47 20 * * *'
 permissions:
@@ -33,6 +38,7 @@ jobs:
           GITLAB_NAMESPACE_ID: '126304343'
           GITLAB_NAMESPACE_PATH: apoorvdarshan
           BACKUP_WORKERS: '2'
+          BACKUP_MAX_DELETIONS: ${{ github.event.inputs.max_deletions || '10' }}
       - name: Save backup report
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
