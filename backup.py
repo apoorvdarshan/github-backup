@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Cloud Git backups. Never executes source repository code. Deletes a backup only
-after GitHub confirms its source repository was deleted."""
+"""Cloud Git backups. Never executes source repository code. Mirrors deleted
+branches and tags, and deletes a backup only after GitHub confirms its source
+repository was deleted."""
 from __future__ import annotations
 
 import concurrent.futures
@@ -162,6 +163,11 @@ def source_matches(source, destination):
     return all(destination.get(ref) == sha for ref, sha in source.items())
 
 
+def stale_refs(source, destination):
+    """Destination branches and tags deleted from the source; recovery tags stay."""
+    return {ref: sha for ref, sha in destination.items() if ref not in source and not ref.startswith(RECOVERY)}
+
+
 def ref_batches(refs, size=256):
     items = list(refs.items())
     for offset in range(0, len(items), size):
@@ -175,7 +181,7 @@ def assigned_repositories(repos, index, total):
 
 
 def recovery_plan(source, destination):
-    """Keep every destination tip that will be replaced; deleted refs remain."""
+    """Keep every destination tip that a rewritten source ref will replace."""
     plan = {}
     for ref, sha in source.items():
         old = destination.get(ref)
@@ -414,19 +420,81 @@ def destination_project(repo, existing):
         if not project or marker not in (project.get("description") or ""):
             raise BackupError(f"Could not create or safely identify backup destination ({exc})") from None
         project = restore_if_scheduled(project)
-    # Backup namespaces have no human contributions; the bot must update rewritten refs.
-    for branch in pages(f"/projects/{project['id']}/protected_branches"):
-        api("DELETE", f"/projects/{project['id']}/protected_branches/{urllib.parse.quote(branch['name'], safe='')}")
+    unprotect_branches(project)
     return project
 
 
-def sync_git(source_url, destination_url, root, source_env, dest_env, project=None):
+def unprotect_branches(project):
+    # Backup namespaces have no human contributions; the bot must update rewritten
+    # and deleted refs.
+    for branch in pages(f"/projects/{project['id']}/protected_branches"):
+        api("DELETE", f"/projects/{project['id']}/protected_branches/{urllib.parse.quote(branch['name'], safe='')}")
+
+
+def sync_git(source_url, destination_url, root, source_env, dest_env, project=None, default_branch=None):
     source = remote_refs(source_url, source_env)
     if any(ref.startswith(RECOVERY) for ref in source):
         raise BackupError("Source uses reserved backup-history tag namespace")
     destination = remote_refs(destination_url, dest_env)
-    if source_matches(source, destination):
+    stale = stale_refs(source, destination)
+    if source_matches(source, destination) and not stale:
         return {"status": "unchanged", "refs": len(source)}
+    blocking = {}
+    if stale:
+        # Re-read the source so a transient empty or partial listing never deletes backup refs.
+        if not source or remote_refs(source_url, source_env) != source:
+            raise BackupError("Source refs are empty or changed; refusing to delete backup refs")
+        # Git cannot create refs/heads/a/b while refs/heads/a exists (or the reverse),
+        # so refs that block a new source ref by path go before publishing.
+        dirs = {ref[:i] for ref in source for i, char in enumerate(ref) if char == "/"}
+        blocking = {ref: sha for ref, sha in stale.items()
+                    if ref in dirs or any(ref[:i] in source for i, char in enumerate(ref) if char == "/")}
+        if blocking:
+            present = {ref: sha for ref, sha in source.items() if ref in destination}
+            delete_refs(blocking, present, destination_url, root, dest_env, project, default_branch)
+    recovery = {}
+    if not source_matches(source, destination):
+        recovery = publish_source(source, destination, source_url, destination_url, root, source_env, dest_env, project)
+    if len(stale) > len(blocking):
+        rest = {ref: sha for ref, sha in stale.items() if ref not in blocking}
+        delete_refs(rest, source, destination_url, root, dest_env, project, default_branch)
+    actual = remote_refs(destination_url, dest_env)
+    if not source_matches(source, actual) or not source_matches(recovery, actual) or stale_refs(source, actual):
+        raise BackupError("Post-push verification failed")
+    if remote_refs(source_url, source_env) != source:
+        raise BackupError("Source changed during backup; retry next run")
+    return {"status": "synced", "refs": len(source), "recovery_refs": len(recovery), "deleted_refs": len(stale)}
+
+
+def delete_refs(stale, available, destination_url, root, dest_env, project, default_branch):
+    """Mirror branches and tags deleted from the source, leased like every other push.
+    `available` holds source refs that already exist in the destination."""
+    current = project.get("default_branch") if project else None
+    if current and f"refs/heads/{current}" in stale:
+        # GitLab refuses to delete its default branch, so switch to a source branch first.
+        heads = sorted(ref[11:] for ref in available if ref.startswith("refs/heads/"))
+        replacement = default_branch if default_branch and f"refs/heads/{default_branch}" in available else (heads[0] if heads else None)
+        if not replacement:
+            raise BackupError("Deleted default branch has no replacement source branch")
+        api("PUT", f"/projects/{project['id']}", {"default_branch": replacement})
+        project["default_branch"] = replacement
+    if project and any(ref.startswith("refs/heads/") for ref in stale):
+        unprotect_branches(project)
+    # Deleting refs needs no objects, so push from an empty repository.
+    empty = Path(root) / "deletions.git"
+    command(["git", "init", "--bare", str(empty)])
+    for batch in ref_batches(stale):
+        leases = [f"--force-with-lease={ref}:{sha}" for ref, sha in batch.items()]
+        try:
+            command(["git", "push", "--atomic", *leases, destination_url, *[f":{ref}" for ref in batch]], cwd=empty, env=dest_env, timeout=300)
+        except BackupError:
+            # A connection can fail after GitLab has committed the transaction.
+            if set(batch) & set(remote_refs(destination_url, dest_env)):
+                raise
+
+
+def publish_source(source, destination, source_url, destination_url, root, source_env, dest_env, project):
+    """Copy every source branch and tag, saving replaced tips as recovery tags."""
     repo_dir = Path(root) / "repository.git"
     command(["git", "init", "--bare", str(repo_dir)])
     command(["git", "remote", "add", "origin", source_url], cwd=repo_dir)
@@ -460,8 +528,7 @@ def sync_git(source_url, destination_url, root, source_env, dest_env, project=No
             # GitLab may auto-protect the default branch after the initial push.
             # Old tips are already saved; permit leased updates in this managed
             # backup so a future source rewrite does not silently stop syncing.
-            for branch in pages(f"/projects/{project['id']}/protected_branches"):
-                api('DELETE', f"/projects/{project['id']}/protected_branches/{urllib.parse.quote(branch['name'], safe='')}")
+            unprotect_branches(project)
     original_default = project.get("default_branch") if project else None
     collision = f"refs/tags/{original_default}" if original_default else None
     switched_default = False
@@ -492,12 +559,7 @@ def sync_git(source_url, destination_url, root, source_env, dest_env, project=No
                 raise
     if switched_default and f"refs/heads/{original_default}" in source:
         api("PUT", f"/projects/{project['id']}", {"default_branch": original_default})
-    actual = remote_refs(destination_url, dest_env)
-    if not source_matches(source, actual) or not source_matches(recovery, actual):
-        raise BackupError("Post-push verification failed")
-    if remote_refs(source_url, source_env) != source:
-        raise BackupError("Source changed during backup; retry next run")
-    return {"status": "synced", "refs": len(source), "recovery_refs": len(recovery)}
+    return recovery
 
 
 def process(repo, existing):
@@ -513,7 +575,8 @@ def process(repo, existing):
             if repo['id'] in BUNDLE_SOURCE_IDS:
                 result.update(sync_bundle(repo, project, root, source_env))
             else:
-                result.update(sync_git(f"https://github.com/{OWNER}/{repo['name']}.git", project["http_url_to_repo"], root, source_env, dest_env, project=project))
+                result.update(sync_git(f"https://github.com/{OWNER}/{repo['name']}.git", project["http_url_to_repo"], root, source_env, dest_env,
+                                       project=project, default_branch=repo.get("default_branch")))
         if repo.get("default_branch") and result.get("refs") and result.get('format') != 'git-bundle':
             if project.get("default_branch") != repo["default_branch"]:
                 api("PUT", f"/projects/{project['id']}", {"default_branch": repo["default_branch"]})

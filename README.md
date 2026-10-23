@@ -20,9 +20,10 @@ runners run the scheduled job; no Mac, local cron, or self-hosted runner is need
 - Issues, merge requests, CI, wiki, packages, and routine emails are disabled on
   backup projects, except the private package registry for the approved Scrapy
   bundle below. This GitHub repository alone runs backup automation.
-- Deleted branches/tags are retained. Source renames are matched by stable GitHub
-  repository ID. Unrelated destinations are never overwritten or deleted. A new
-  source whose name is still used in GitLab is stored as `<name>-github-<source ID>`.
+- Branches and tags deleted on GitHub are deleted from the backup too. Source
+  renames are matched by stable GitHub repository ID. Unrelated destinations are
+  never overwritten or deleted. A new source whose name is still used in GitLab is
+  stored as `<name>-github-<source ID>`.
 - When a GitHub repository is deleted, its GitLab backup is deleted too, but only
   after GitHub confirms it: the stable repository ID must return HTTP 404. Renamed
   and transferred repositories still resolve, so their backups stay. GitLab.com
@@ -39,7 +40,9 @@ runners run the scheduled job; no Mac, local cron, or self-hosted runner is need
 - Before replacing an existing branch/tag, the old object is saved under a
   `backup-history/<UTC run>/<ref hash>-<old object>` recovery tag. Leases prevent
   overwriting concurrent destination changes. Recovery tags have no automatic
-  expiry; monitor storage and prune only after deliberate review.
+  expiry; monitor storage and prune only after deliberate review. Deleted
+  branches/tags get no recovery tag. Before deleting, the job re-reads the source,
+  and it never deletes refs for a source that lists no branches or tags.
 - Git refs are verified against GitHub after each write. LFS fetch/upload must
   succeed before new refs are published. Failures fail the pipeline; per-repository
   results are retained as GitHub Actions artifacts for 14 days.
@@ -116,8 +119,9 @@ last completed copies even when GitHub is unavailable.
 - The obsolete GitLab watchdog PAT and GitHub `GITLAB_MONITOR_TOKEN` secret are
   removed after the new health workflow is verified.
 - Source IDs identify destinations across source renames; no second initial copy
-  is needed. Deleted refs and older bundle versions remain retained. Recovery refs are saved before any rewritten source tip replaces
-  the destination, and leased pushes protect against concurrent changes.
+  is needed. Older bundle versions remain retained. Recovery refs are saved before
+  any rewritten source tip replaces the destination, and leased pushes protect
+  against concurrent changes.
 - The local checkout is only for development. No Mac service, cron, or local
   checkout is required for normal operation.
 
@@ -166,7 +170,7 @@ including for administrators. The test workflow receives no backup secrets and
 does not perform live backups. Repository visibility is a separate setting.
 
 Run `python3 -m unittest discover -s tests -v`. Tests exercise actual local Git
-pushes, rewritten-history recovery, deleted-ref retention, bundle restore with a
+pushes, rewritten-history recovery, deleted-ref mirroring, bundle restore with a
 malformed historical commit, corrupted archive detection, credential isolation,
 redirect authentication, and fresh/stale/missing workflow checks. LFS transport
 is verified by real cloud backup runs rather than mocked local tests.
