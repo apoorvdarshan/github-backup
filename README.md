@@ -73,7 +73,8 @@ clone is removed after use.
 
 Repository secrets are never passed to pull requests from forks, and workflows
 from all external contributors require approval before they run. No workflow uses
-`pull_request_target`, and third-party actions are pinned to full commit SHAs.
+`pull_request_target`, and third-party actions are pinned to full commit SHAs that
+Dependabot keeps current.
 
 ## Credentials and alerts
 
